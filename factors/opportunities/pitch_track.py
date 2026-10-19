@@ -38,7 +38,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent.parent   # factors/opportunities/ → deepseek-harness-quant
 sys.path.insert(0, str(BASE))
 
-BARS_DB = Path(r"data/cache/bars.db")
+BARS_DB = BASE / "data" / "cache" / "bars.db"   # ★2026-10-15 P1-A 绝对路径（原相对依赖 cwd）
 FWD_HORIZONS = (1, 5, 20, 60)
 
 
