@@ -17,6 +17,17 @@ repos:
     rev: v4.6.0
     hooks:
       - id: check-yaml
+        # ★2026-10-19 排除 Cordis agent 配置：它们用 js-yaml 的 `!!js` 标签嵌入
+        #   原始 JavaScript 表达式（如 `disabled: !!js process.platform !== 'win32'`），
+        #   这是 Cordis 框架的合法语法，但 PyYAML（check-yaml 用的解析器）无法构造
+        #   该标签 → 报 "could not determine a constructor for the tag js"。
+        #   注意：这是**钩子与项目资产的语言不兼容**，不是文件损坏，
+        #   所以正确做法是排除而非改写资产（改写会破坏 Cordis 运行时语义）。
+        exclude: |
+          (?x)^(
+            assets/presets/.*\.cordis\.yml
+            | harness/home/profiles/headless/cordis\.patch\.yml
+          )$
       - id: check-toml
       - id: check-merge-conflict
       # 数据资产 2.6GB 不进 git，这条是最后一道闸
