@@ -411,6 +411,22 @@ class Handler(BaseHTTPRequestHandler):
     SLOW_S = float(os.environ.get("DECK_SLOW_S", "1.0"))
     VERY_SLOW_S = 10.0
 
+    def _require_auth(self):
+        """DECK_API_TOKEN 未设置 → 不启用鉴权（保持本地现状）。
+        设置后，所有非探针请求须带 `Authorization: Bearer <token>`，否则回 401。
+        返回 True 表示『需要鉴权且未通过，已回 401』。"""
+        tok = os.environ.get("DECK_API_TOKEN")
+        if not tok:
+            return False
+        if self.headers.get("Authorization", "") == "Bearer " + tok:
+            return False
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", "Bearer")
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"ok": False, "error": "unauthorized"}).encode("utf-8"))
+        return True
+
     def do_GET(self):
         t0 = time.time()
         try:
@@ -424,6 +440,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_GET_impl(self):
         path = self.path.split("?")[0]
+        # ★2026-10-19 H-5 修复：启用 DECK_API_TOKEN 时，对所有非探针 GET 要求 Bearer 鉴权
+        if path not in ("/healthz", "/readyz") and self._require_auth():
+            return
         # ★2026-10-18 探针（借 Kubernetes liveness/readiness 语义，见 deck/health.py 顶部说明）
         #   /healthz 零 I/O，只回进程内状态 —— watchdog 用它判"该不该重启"。
         #   /readyz  查依赖与产物新鲜度 —— 只用于"能不能服务/数据新不新"，**绝不触发重启**。
@@ -1072,6 +1091,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
+        # ★2026-10-19 H-5 修复：启用 DECK_API_TOKEN 时，所有 POST 要求 Bearer 鉴权（含 /api/proxy 与 /api/import）
+        if self._require_auth():
+            return
         if path.startswith("/api/proxy/"):   # ★2026-08-16 反向代理 POST → :3080（删除/批量/清空/发送全走这里）
             import urllib.request as _ur
             import urllib.error as _ue
