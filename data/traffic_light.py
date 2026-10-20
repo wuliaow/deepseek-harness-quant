@@ -98,26 +98,31 @@ def _bars_latest() -> tuple:
 
 
 def load_monthly() -> pd.Series:
-    """沪深300 月末收盘：2005-2018 baostock 缓存 + 2019+ bars.db（每日刷新，保证实时）"""
+    """沪深300 月末收盘：parquet 完整序列（baostock/akshare 2002+）为主源，
+    bars.db SH.000300 仅叠加其实际覆盖的最近月（每日刷新，保证实时）。
+    ★修复（2026-10-20）：bars.db SH.000300 仅增量写入近月（实测仅 2 个月 / 16 行），
+    原逻辑以 bars.db 近月覆盖整段 2019+，但"非空即采用"导致 2019-01→2026-08 整段缺失
+    → 月度序列留下 7.75 年空洞 → 均线 MA6/MA12 跨洞计算污染、且 build() 回测对 92 个缺失月
+    无择时信号（原默认满仓）。现改为：parquet 作为 2019+ 完整主源，bars.db 仅叠加覆盖的同月
+    （duplicated keep="last" 保证近月以 bars.db 为准），彻底消除空洞。"""
     _ensure_parquet()
     parts = []
     if PARQUET.exists():
         pre = pd.read_parquet(PARQUET)["close"].resample("ME").last()
         pre = pre[pre.index < pd.Timestamp("2019-01-01")]
         parts.append(pre)
+        # ★2019+ 主源 = parquet 完整序列（bars.db 指数行未全量入库，不能裸用其覆盖整段）
+        post_pq = pd.read_parquet(PARQUET)["close"]
+        post_pq = post_pq[post_pq.index >= pd.Timestamp("2019-01-01")].resample("ME").last()
+        parts.append(post_pq)
     con = sqlite3.connect(f"file:{BARS_DB}?mode=ro&immutable=1", uri=True)
     rows = con.execute(
         "SELECT date, close FROM daily_bar WHERE code='SH.000300' AND adjust='none' AND date>='2019-01-01' ORDER BY date").fetchall()
     con.close()
     if rows:
+        # 叠加：bars.db 实际覆盖的近月覆盖 parquet 同月（实时优先）；其余月份仍由 parquet 补齐
         d = pd.Series({pd.Timestamp(r[0]): float(r[1]) for r in rows}).sort_index()
         parts.append(d.resample("ME").last())
-    elif PARQUET.exists():
-        # ★2026-10-15 修复：bars.db 无指数行（bulk_loader 只下股票）→ 回退用 baostock 缓存
-        #   的 2019+ 段（原逻辑直接漏掉 2019+ → 近月窗口空序列 → IndexError 崩溃）
-        post = pd.read_parquet(PARQUET)["close"]
-        post = post[post.index >= pd.Timestamp("2019-01-01")].resample("ME").last()
-        parts.append(post)
     monthly = pd.concat(parts)
     monthly = monthly[~monthly.index.duplicated(keep="last")].sort_index()
     return monthly.astype(float)
@@ -132,21 +137,25 @@ def compute_signal(monthly: pd.Series):
 
 
 def run_state_machine(monthly, ratio):
-    """三态（死区阈值）：ratio>+1% 贪婪 / <-1% 恐慌 / 之间观望；返回 states + 恐慌周期"""
+    """三态（死区阈值）：ratio>+1% 贪婪 / <-1% 恐慌 / 之间观望；返回 states + 恐慌周期。
+    ★修正：数据缺失（ratio 为 NaN，如序列前 MA 预热期、或 bars.db 空洞）不再默认「贪婪/满仓」
+    ——那是最激进、最危险的默认（"无信号=满仓"是方向性错误）。改为沿用上一已知状态；
+    尚无已知状态时取「观望」（半仓），符合低频策略"宁缺毋滥、现金是仓位"的纪律。"""
     states = {}
     episodes = []
     cur_start = None
+    last_known = None
     for mo in monthly.index:
         r = ratio.get(mo, float("nan"))
         if pd.isna(r):
-            states[mo] = "greedy"
-            continue
-        if r > BAND:
+            st = last_known if last_known is not None else "wait"
+        elif r > BAND:
             st = "greedy"
         elif r < -BAND:
             st = "panic"
         else:
             st = "wait"
+        last_known = st
         states[mo] = st
         if st == "panic" and cur_start is None:
             cur_start = mo
@@ -208,7 +217,9 @@ def build() -> dict:
     # T+1 回测：仓位 贪婪1.0/观望0.5/恐慌0.0，基准=全池等权买入持有
     pos_map = {"greedy": 1.0, "wait": 0.5, "panic": 0.0}
     states_s = {str(mo)[:7]: v for mo, v in states.items()}
-    pos = pd.Series({mo: pos_map[states_s.get(mo, "greedy")] for mo in eq.index})
+    # ★修正：缺失月份（股票宇宙有、HS300 月线无，如数据空洞）沿用保守「观望」(0.5)，
+    #   不再默认「贪婪」(1.0 满仓)——与 run_state_machine 的缺失处理保持一致，避免"无信号=满仓"
+    pos = pd.Series({mo: pos_map[states_s.get(mo, "wait")] for mo in eq.index})
 
     def _win(since):
         eqw = eq[eq.index >= since]
