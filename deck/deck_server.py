@@ -366,6 +366,16 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write(f"[deck] {self.address_string()} {fmt % args}\n")
 
+    def end_headers(self):
+        # ★2026-10-20 L-3 修复：所有响应统一补安全响应头（nosniff / 防点击劫持）。
+        #   集中在 end_headers 一处注入，覆盖 _send / 探针 / 代理透传 / 鉴权错误等全部出口。
+        try:
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+        except Exception:
+            pass
+        super().end_headers()
+
     def _send(self, code: int, body: bytes, ctype: str = "application/json"):
         try:
             self.send_response(code)
@@ -1094,6 +1104,13 @@ class Handler(BaseHTTPRequestHandler):
         # ★2026-10-19 H-5 修复：启用 DECK_API_TOKEN 时，所有 POST 要求 Bearer 鉴权（含 /api/proxy 与 /api/import）
         if self._require_auth():
             return
+        # ★2026-10-20 M-2 修复：CSRF 防御——状态变更 POST 强制 JSON Content-Type。
+        #   浏览器对 form / 简单跨站请求默认不发 application/json，且会触发 CORS 预检
+        #   （CSRF 攻击者无法代完成预检），故可阻断跨站伪造写操作。
+        #   前端（decide.js / api.js / control.html）与压测脚本均已带此头，不误伤正常请求。
+        _ct = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if _ct != "application/json":
+            return self._send_json({"ok": False, "error": "POST 仅接受 application/json"}, 415)
         if path.startswith("/api/proxy/"):   # ★2026-08-16 反向代理 POST → :3080（删除/批量/清空/发送全走这里）
             import urllib.request as _ur
             import urllib.error as _ue
