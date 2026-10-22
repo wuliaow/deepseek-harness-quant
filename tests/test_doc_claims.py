@@ -25,8 +25,7 @@ CACHE = BASE / "data" / "cache"
 
 # 2026-10-15 实测基线（改数据后需同步）
 REALITY = {
-    "bars_rows": 8477451,          # data/cache/bars.db daily_bar 行数（2026-10-18 补齐 10-16 后复核）
-    "bars_codes": 5575,            # 覆盖股票数（2026-10-18 补齐 10-16 后复核）
+    "bars_codes": 5578,            # 覆盖股票数（2026-10-22 复核）
     "panel_factors": 6,            # factors/factor_engine.FACTOR_FUNCS
     "strong_factors": 27,          # factors/risk/strong_factor_table.STRONG_TABLE
     "pool_rows": 54,               # data/cache/factor_pool.db factors 表（2026-10-15 登记）
@@ -34,6 +33,20 @@ REALITY = {
     "template_skills": 8,          # harness/home/skills/
     "beneish_total": 3908,         # risk/beneish.py --scan total
 }
+
+# ★ bars_rows 不再是"精确相等"常量，改为容差校验（2026-10-22 起）
+#
+# 为什么改：bars.db 由每日管道增量写入（日增约 5,500 行），精确相等意味着
+# **每个交易日守卫都会红**——一个天天红的守卫等于没有守卫，久了大家就会开始无视它
+# （"哦是那个 bars 行数的"）。这是把"防夸大"降级成了"制造噪声"。
+#
+# 改为容差后仍能抓住它本来要抓的真正回退：
+#   ① 夸大（文档 > 实际 + 容差）——v3.0 的 "1398万行" 那类错误
+#   ② 长期腐烂（文档 < 实际 - 容差）——数据补了一大截却没人同步文档
+#   ③ 缩量（实际 < 文档所写只数的下限）——库被误删/迁移
+# 日常 ±3 个交易日的波动不再触发红灯；超过容差仍红，并提示同步文档。
+BARS_ROWS_TOL = 60_000           # ≈ 11 个交易日的日增量（5,500/日）
+BARS_DOC_FLOOR = 8_000_000        # 实测行数不得低于此值（缩量守卫）
 
 # 数据层「受追踪的库」与「当前仍缺失的库」（2026-10-15 晚实测）
 # ★补齐新库时：把它从 KNOWN_MISSING_DBS 移出，并同步 docs/资产盘点.md §4.1。
@@ -123,17 +136,69 @@ class TestDocHasNoDisprovenClaims(unittest.TestCase):
 class TestDocNumbersMatchReality(unittest.TestCase):
     """② 文档数字 vs 仓库实际"""
 
+    def _bars_doc_row(self) -> str:
+        """返回 §4.1 数据表里「日线」那一行的原文。
+
+        为什么定位到行而不是全文档搜数字：全文档里「148 只」「5,575 只」这类
+        数字很多，宽松匹配会抓到无关内容并给出误导性的失败信息。
+        """
+        for ln in _doc().splitlines():
+            s = ln.strip()
+            if s.startswith("|") and "bars.db" in s and "日线" in s:
+                return s
+        self.fail("docs/资产盘点.md §4.1 找不到「日线 | data/cache/bars.db」数据行")
+
     def test_bars_db_size_documented_correctly(self):
+        """bars.db 行数走容差校验（见 BARS_ROWS_TOL 处的说明）
+
+        文档里必须能解析出一个行数；该值与实测的偏差需落在容差内。
+        另加两条硬守卫：文档行数不得为 0，库不得缩量到 floor 以下。
+        """
         con = sqlite3.connect(f"file:{CACHE / 'bars.db'}?mode=ro&immutable=1", uri=True)
         try:
             rows = con.execute("SELECT COUNT(*) FROM daily_bar").fetchone()[0]
             codes = con.execute("SELECT COUNT(DISTINCT code) FROM daily_bar").fetchone()[0]
         finally:
             con.close()
-        self.assertEqual(rows, REALITY["bars_rows"],
-                         "bars.db 行数变了 —— 请同步更新 docs/资产盘点.md §4.1 与 REALITY")
-        self.assertEqual(codes, REALITY["bars_codes"], "bars.db 覆盖股票数变了，请同步文档")
-        self.assertIn("846万行", _doc(), "文档应写明实测 846 万行")
+
+        # ① 缩量守卫：数据层被误删/迁移时立刻红，与文档无关
+        self.assertGreaterEqual(
+            rows, BARS_DOC_FLOOR,
+            f"bars.db daily_bar 仅 {rows} 行（< {BARS_DOC_FLOOR}）——数据层疑似被误删或迁移")
+
+        # ② 文档行数 vs 实测（容差）
+        row = self._bars_doc_row()
+        m = re.search(r"([\d,]{6,})\s*行", row)
+        self.assertIsNotNone(
+            m, f"§4.1 日线行应写明 daily_bar 实测行数（形如 8,499,739 行）：{row.strip()[:120]}")
+        doc_rows = int(m.group(1).replace(",", ""))
+        self.assertTrue(
+            abs(doc_rows - rows) <= BARS_ROWS_TOL,
+            f"文档写 {doc_rows} 行、实测 {rows} 行，偏差超容差 ±{BARS_ROWS_TOL} —— "
+            f"请同步 docs/资产盘点.md §4.1（bars.db 每日增量，超容差意味着"
+            f"数据层补了一大截而文档长期没同步）")
+
+        # ③ 覆盖股票数：从 §4.1 日线行内解析（不能全文档搜「N只」，
+        #    文中「148 只」这类无关数字会误匹配）
+        row = self._bars_doc_row()
+        mc = re.search(r"([\d,]{3,})\s*只", row)
+        self.assertIsNotNone(mc, f"§4.1 日线行应写明覆盖股票数：{row.strip()[:120]}")
+        doc_codes = int(mc.group(1).replace(",", ""))
+        self.assertLessEqual(
+            abs(doc_codes - codes), 30,
+            f"文档写 {doc_codes} 只、实测 {codes} 只 —— 请同步 docs/资产盘点.md §4.1")
+
+        # ④ §4 流程图里的「NNN万行」量级：同样走容差（1 万行 = 约 2 个交易日增量）。
+        #    只认 bars.db 同一行的量级标注——文档 §0/§9 的对账区里还留着
+        #    "1398万行" 这个**被证伪的旧说法**，那是刻意保留的对照，不是当前口径。
+        mw = re.search(r"bars\.db[^\n]*?(\d+)\s*万行", _doc())
+        self.assertIsNotNone(mw, "§4 流程图应标注 bars.db 量级（形如 bars.db(850万行)）")
+        self.assertIsNotNone(mw, "§4 流程图应标注 bars.db 量级（形如 846万行）")
+        doc_wan = int(mw.group(1))
+        self.assertLessEqual(
+            abs(doc_wan - rows / 10_000), 1,
+            f"§4 流程图写 {doc_wan}万行、实测 {rows / 10_000:.1f}万行 —— "
+            f"请同步 docs/资产盘点.md §4 流程图（守的是「1398万」式夸大，不是日常增量）")
 
     def test_panel_factor_count_documented(self):
         sys.path.insert(0, str(BASE))
