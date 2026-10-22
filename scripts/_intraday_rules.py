@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """DSHQuant 盘中监控 - 规则引擎v2（AND/OR 组合 + 冷却 + 降级源）+ 落盘
 用法: python scripts/_intraday_rules.py
 v3 变更（2026-10-22 14:41）：
@@ -10,19 +9,30 @@ v3 变更（2026-10-22 14:41）：
 v4 变更（2026-10-22）：修复沪深300盘中度 gap。
 - 根因：hithink `market snapshot` 不含指数行（FUYAO_3001 Target not found，非瞬时错误），
   旧代码把 index_000300 硬编码为 unavailable，导致 index_000300_drop_gt1_5 规则永远不触发。
-- 修法：新增 fetch_hs300_index()，主源 hithink `index snapshot --thscodes 000300.SH`（shell=True 解析 npm .cmd shim），
-  降级源新浪 hq.sinajs.cn/list=sh000300；两源都失败才 available=False（不编造信号）。
+- 修法 fetch_hs300_index() 三级优先级：
+  0) 自动化(59e41a1d)采集文件 logs/_raw_index_<日期>.json（优先复用，避免规则脚本重复抓网）
+  1) 主源 hithink `index snapshot --thscodes 000300.SH`（shell=True 解析 npm .cmd shim）
+  2) 降级源新浪 hq.sinajs.cn/list=sh000300（GBK 解析，涨跌自算）
+  三层都失败才 available=False（不编造信号，安全侧默认）。
 - 效果：index_000300_drop_gt1_5 规则恢复真实生效（日内跌幅>1.5%并入通知）。
+v5 变更（2026-10-22）：配套自动化 59e41a1d 步骤2 新增指数采集（index snapshot + 新浪降级），
+  写入 logs/_raw_index_<日期>.json；本脚本优先读该文件，自动化正常时零额外网络请求。
 """
-import sqlite3, glob, os, json, sys, subprocess, urllib.request
-from datetime import datetime, timezone, timedelta
+import glob
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime, timedelta, timezone
 
 TZ = timezone(timedelta(hours=8))
 NOW = datetime.now(TZ)
 DATE = NOW.strftime('%Y%m%d')
-LOG = os.path.join('logs', 'intraday_monitor_%s.jsonl' % DATE)
+LOG = os.path.join('logs', f'intraday_monitor_{DATE}.jsonl')
 
-_RAW_FILE = os.environ.get('INTRA_RAW_CLI', os.path.join('logs', '_raw_cli_%s.json' % DATE))
+_RAW_FILE = os.environ.get('INTRA_RAW_CLI', os.path.join('logs', f'_raw_cli_{DATE}.json'))
 if os.path.exists(_RAW_FILE):
     with open(_RAW_FILE, 'r', encoding='utf-8') as _f:
         RAW_CLI_JSON = _f.read()
@@ -46,15 +56,15 @@ def local_rows(code, limit=8):
         if not os.path.exists(db):
             continue
         try:
-            con = sqlite3.connect('file:%s?mode=ro' % db.replace('\\', '/'), uri=True)
+            con = sqlite3.connect('file:{}?mode=ro'.format(db.replace('\\', '/')), uri=True)
             q = "SELECT date, close, volume, amount FROM daily_bar WHERE code=? AND adjust='qfq' ORDER BY date DESC LIMIT ?"
             for d, c, v, a in con.execute(q, (code, limit)):
                 if d >= UNIT_FIX_FROM:
                     v, a = v * 100.0, a * 1000.0
                 merged[d] = (c, v, a)
             con.close()
-        except Exception as e:
-            print('WARN %s: %s' % (db, e), file=sys.stderr)
+        except (OSError, sqlite3.Error) as e:
+            print(f'WARN {db}: {e}', file=sys.stderr)
     return sorted(merged.items(), key=lambda kv: kv[0], reverse=True)
 
 
@@ -92,19 +102,56 @@ for code in CODES:
     d['dev_3d_base'] = {'date': li['date_t_minus_3'], 'close': li['close_t_minus_3']}
     derived[code] = d
 
-# ---- 沪深300 实时指数（双源降级：hithink index snapshot 主源 + 新浪降级源）----
+# ---- 沪深300 实时指数（优先级：自动化采集文件 > hithink index snapshot > 新浪降级）----
+# 自动化（59e41a1d）已单独采集指数并写入本文件，规则脚本优先复用，避免重复网络抓取。
+_INDEX_RAW = os.path.join('logs', f'_raw_index_{DATE}.json')
+
+
+def parse_index_raw(path):
+    """从自动化写入的 logs/_raw_index_<日期>.json 解析沪深300；失败/不可用返回 None"""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not raw or raw.get('available') is False:
+        return None
+    # hithink index snapshot 结构：data.item[0]
+    try:
+        it = raw['data']['item'][0]
+        return {'ok': True, 'source': 'cli-raw-file',
+                'last_price': float(it['last_price']),
+                'prev_price': float(it.get('prev_price') or 0),
+                'pct_chg': float(it.get('price_change_ratio_pct') or 0)}
+    except (KeyError, ValueError, TypeError):
+        pass
+    # 已是扁平结构 {source,last_price,prev_price,pct_chg}
+    if 'last_price' in raw:
+        return {'ok': True, 'source': raw.get('source', 'raw-file'),
+                'last_price': float(raw['last_price']),
+                'prev_price': float(raw.get('prev_price') or 0),
+                'pct_chg': float(raw.get('pct_chg') or 0)}
+    return None
+
+
 def fetch_hs300_index():
     """沪深300 实时指数。
 
-    关键坑：hithink `market snapshot` 不含指数行（FUYAO_3001 Target not found，非瞬时错误），
-    故指数必须走 `index snapshot` 子命令。两层都失败时返回 ok=False，规则不触发（不编造信号）。
-    返回: {ok, source, last_price, prev_price, pct_chg} 或 {ok:False, reason}
+    优先级：
+      0) 自动化已采集文件 logs/_raw_index_<日期>.json（避免重复抓取）
+      1) 主源 hithink `index snapshot`（market snapshot 不含指数行，FUYAO_3001，非瞬时错误）
+      2) 降级源 新浪 hq.sinajs.cn/list=sh000300
+    两层网络都失败才返回 ok=False，规则不触发（不编造信号，安全侧默认）。
     """
-    # 主源：hithink index snapshot（npm 全局 bin 为 .cmd shim，须 shell=True 才能解析）
+    # 0) 优先复用自动化采集文件
+    f = parse_index_raw(_INDEX_RAW)
+    if f:
+        return f
+    # 1) 主源：hithink index snapshot（npm 全局 bin 为 .cmd shim，须 shell=True 才能解析）
     try:
         out = subprocess.run(
             'hithink-finance index snapshot --thscodes 000300.SH',
-            capture_output=True, text=True, shell=True, timeout=15)
+            capture_output=True, text=True, shell=True, timeout=15, check=False)
         if out.returncode == 0:
             data = json.loads(out.stdout)
             items = data.get('data', {}).get('item', [])
@@ -114,9 +161,9 @@ def fetch_hs300_index():
                         'last_price': float(it['last_price']),
                         'prev_price': float(it.get('prev_price') or 0),
                         'pct_chg': float(it.get('price_change_ratio_pct') or 0)}
-    except Exception:
+    except (subprocess.SubprocessError, OSError, ValueError):
         pass
-    # 降级源：新浪指数行情（GBK 编码）
+    # 2) 降级源：新浪指数行情（GBK 编码）
     try:
         req = urllib.request.Request(
             'https://hq.sinajs.cn/list=sh000300',
@@ -129,11 +176,11 @@ def fetch_hs300_index():
             last = float(m[3]); prev = float(m[2])
             pct = (last - prev) / prev * 100 if prev else 0.0
             return {'ok': True, 'source': 'sina', 'last_price': last,
-                    'prev_price': prev, 'pct_chg': pct}
-    except Exception:
+                    'prev_price': prev,             'pct_chg': pct}
+    except (OSError, ValueError):
         pass
     return {'ok': False, 'source': None, 'last_price': None,
-            'prev_price': None, 'pct_chg': None, 'reason': 'both sources failed'}
+            'prev_price': None, 'pct_chg': None, 'reason': 'all sources failed'}
 
 
 hs300 = fetch_hs300_index()
@@ -157,40 +204,40 @@ rules = {
     '600667.R1_loss_cut': {
         'target': '600667.SH',
         'triggered': bool(r1_price and r1_vol),
-        'reason': ('现价%.2f≥14.70成立，量比%.2f<1.5成立 → 减损提示' % (taiji['last'], taiji['vol_ratio'])) if (r1_price and r1_vol)
-                  else ('现价%.2f≥14.70成立，但量比%.2f≥1.5（放量），减损条件不成立 → 转R3只记录' % (taiji['last'], taiji['vol_ratio'])) if r1_price
-                  else '现价%.2f<14.70' % taiji['last'],
+        'reason': ('现价{:.2f}≥14.70成立，量比{:.2f}<1.5成立 → 减损提示'.format(taiji['last'], taiji['vol_ratio'])) if (r1_price and r1_vol)
+                  else ('现价{:.2f}≥14.70成立，但量比{:.2f}≥1.5（放量），减损条件不成立 → 转R3只记录'.format(taiji['last'], taiji['vol_ratio'])) if r1_price
+                  else '现价{:.2f}<14.70'.format(taiji['last']),
     },
     '600667.R2_stop_loss': {
         'target': '600667.SH',
         'triggered': bool(r2_price or r2_pct),
-        'reason': ('现价%.2f≤14.34 → 止损提示' % taiji['last']) if r2_price else (('当日跌幅%.2f%%≤-5%% → 止损提示' % taiji['pct_chg']) if r2_pct else '现价%.2f>14.34且当日%+.2f%%>-5%%，未触发' % (taiji['last'], taiji['pct_chg'])),
+        'reason': ('现价{:.2f}≤14.34 → 止损提示'.format(taiji['last'])) if r2_price else (('当日跌幅{:.2f}%≤-5% → 止损提示'.format(taiji['pct_chg'])) if r2_pct else '现价{:.2f}>14.34且当日{:+.2f}%>-5%，未触发'.format(taiji['last'], taiji['pct_chg'])),
     },
     '600667.R3_volume_surge': {
         'target': '600667.SH',
         'triggered': False, 'record_only': True,
-        'reason': ('现价%.2f≥14.70且量比%.2f≥1.5 → 放量冲高，只记录不通知（14.70限价单已可自动成交）' % (taiji['last'], taiji['vol_ratio'])) if (r1_price and not r1_vol) else '未同时满足（只记录）',
+        'reason': ('现价{:.2f}≥14.70且量比{:.2f}≥1.5 → 放量冲高，只记录不通知（14.70限价单已可自动成交）'.format(taiji['last'], taiji['vol_ratio'])) if (r1_price and not r1_vol) else '未同时满足（只记录）',
     },
     '600667.dev3d_m18': {
         'target': '600667.SH',
         'triggered': bool(taiji['dev_3d'] <= -0.18),
-        'reason': '3日偏离%+.2f%%（现价%.2f / %s收盘%.2f - 1），%s' % (taiji['dev_3d'] * 100, taiji['last'], taiji['dev_3d_base']['date'], taiji['dev_3d_base']['close'], '≤-18%% 已触发' if taiji['dev_3d'] <= -0.18 else '未达-18%预警线'),
+        'reason': '3日偏离{:+.2f}%（现价{:.2f} / {}收盘{:.2f} - 1），{}'.format(taiji['dev_3d'] * 100, taiji['last'], taiji['dev_3d_base']['date'], taiji['dev_3d_base']['close'], '≤-18%% 已触发' if taiji['dev_3d'] <= -0.18 else '未达-18%预警线'),
     },
     'candidates_abs_chg_gt3': {
         'target': 'PER_CANDIDATE',
         'triggered': bool(triggered_cands),
         'detail': {c: {'pct_chg': cands[c]['pct_chg'], 'last': cands[c]['last'], 'prev': cands[c]['prev']} for c in triggered_cands},
-        'reason': ('触发标的: ' + ', '.join('%s(%s) %+.2f%%' % (code_short(c), c, cands[c]['pct_chg']) for c in triggered_cands)) if triggered_cands else '四强当日涨跌幅绝对值最大%.2f%%，均未>3%%' % max(abs(cands[c]['pct_chg']) for c in CAND_CODES),
+        'reason': ('触发标的: ' + ', '.join('{}({}) {:+.2f}%'.format(code_short(c), c, cands[c]['pct_chg']) for c in triggered_cands)) if triggered_cands else '四强当日涨跌幅绝对值最大{:.2f}%，均未>3%'.format(max(abs(cands[c]['pct_chg']) for c in CAND_CODES)),
     },
     'candidates_dev3d_p18': {
         'target': 'PER_CANDIDATE',
         'triggered': bool(dev18_cands),
-        'reason': ('四强3日偏离≥+18%%: ' + ', '.join(dev18_cands)) if dev18_cands else '四强3日偏离最高%+.2f%%（%s），均未≥+18%%' % (max(cands[c]['dev_3d'] for c in CAND_CODES) * 100, max(CAND_CODES, key=lambda c: cands[c]['dev_3d'])),
+        'reason': ('四强3日偏离≥+18%%: ' + ', '.join(dev18_cands)) if dev18_cands else '四强3日偏离最高{:+.2f}%（{}），均未≥+18%'.format(max(cands[c]['dev_3d'] for c in CAND_CODES) * 100, max(CAND_CODES, key=lambda c: cands[c]['dev_3d'])),
     },
     'index_000300_drop_gt1_5': {
         'target': '000300.SH',
         'triggered': bool(hs300['ok'] and hs300['pct_chg'] <= -1.5),
-        'reason': ('沪深300 日内 %+.2f%% ≤ -1.5%% → 大盘弱势，并入通知（源:%s）' % (hs300['pct_chg'], hs300['source'])) if hs300['ok']
+        'reason': ('沪深300 日内 {:+.2f}% ≤ -1.5% → 大盘弱势，并入通知（源:{}）'.format(hs300['pct_chg'], hs300['source'])) if hs300['ok']
                   else '沪深300 双源均不可用，跳过（不编造信号）',
     },
 }
@@ -209,13 +256,13 @@ if os.path.exists(LOG):
                 continue
             try:
                 row = json.loads(line)
-            except Exception:
+            except ValueError:
                 continue
             for rname, rval in (row.get('rules') or {}).items():
                 if rval.get('triggered'):
                     if is_per_candidate(rname, rval):
                         for tc in (rval.get('detail') or {}):
-                            prior_keys.add('%s|%s' % (rname, tc))
+                            prior_keys.add(f'{rname}|{tc}')
                     else:
                         prior_keys.add(rname)
             # notification_sent 行（含旧格式）：triggers + trigger_basis 的标的键
@@ -224,7 +271,7 @@ if os.path.exists(LOG):
             if trigs and basis and isinstance(basis, dict):
                 for t in trigs:
                     for tc in basis:
-                        prior_keys.add('%s|%s' % (t, tc))
+                        prior_keys.add(f'{t}|{tc}')
             for t in trigs:
                 if t not in [k.split('|')[0] for k in prior_keys]:
                     prior_keys.add(t)
@@ -234,7 +281,7 @@ def rule_new(rname, rval):
     if not rval.get('triggered'):
         return []
     if is_per_candidate(rname, rval):
-        return [tc for tc in (rval.get('detail') or {}) if '%s|%s' % (rname, tc) not in prior_keys]
+        return [tc for tc in (rval.get('detail') or {}) if f'{rname}|{tc}' not in prior_keys]
     return [None] if rname not in prior_keys else []
 
 new_triggers = []      # [(rule, target_or_None), ...]
@@ -245,7 +292,7 @@ for rname, rval in rules.items():
     if rval.get('triggered'):
         if is_per_candidate(rname, rval):
             for tc in (rval.get('detail') or {}):
-                if '%s|%s' % (rname, tc) in prior_keys:
+                if f'{rname}|{tc}' in prior_keys:
                     suppressed.append((rname, tc))
         elif rname in prior_keys:
             suppressed.append((rname, None))
